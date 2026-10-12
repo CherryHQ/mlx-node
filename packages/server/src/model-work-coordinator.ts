@@ -1,5 +1,10 @@
 import type { ModelLoadRecord } from './health.js';
-import type { PreDispatchAdmission, SessionRegistry } from './session-registry.js';
+import type { PreDispatchAdmission } from './session-registry.js';
+
+/** Minimal admission surface shared by chat sessions and decision inference. */
+export interface ModelAdmissionLane {
+  beginPreDispatchAdmission(): PreDispatchAdmission;
+}
 
 /**
  * Render a thrown value for {@link ModelLoadRecord.error}.
@@ -61,7 +66,7 @@ export interface ModelLoadAdmission {
    * registry; transferring after a hot-swap releases the old reservation
    * before charging the new binding.
    */
-  transferToResident(registry: SessionRegistry): PreDispatchAdmission;
+  transferToResident(registry: ModelAdmissionLane): PreDispatchAdmission;
   /** Idempotently release this request's current cold or resident unit. */
   release(): void;
 }
@@ -69,7 +74,7 @@ export interface ModelLoadAdmission {
 interface ModelLoadAdmissionState {
   released: boolean;
   coldCounted: boolean;
-  residentRegistry?: SessionRegistry;
+  residentRegistry?: ModelAdmissionLane;
   residentAdmission?: PreDispatchAdmission;
   transferError?: unknown;
 }
@@ -110,7 +115,7 @@ export class ModelWorkCoordinator {
    * Publishing transfers every already-admitted cold request before another
    * request can spend the resident budget independently.
    */
-  private readonly residentRegistriesByModel = new Map<string, SessionRegistry>();
+  private readonly residentRegistriesByModel = new Map<string, ModelAdmissionLane>();
   private readonly maxRequestLoadQueueDepth: number | undefined;
   /**
    * Most recent settled load bracket. Retained here because the coordinator
@@ -128,10 +133,10 @@ export class ModelWorkCoordinator {
 
   /**
    * Bound requests that arrive before a model has a resident
-   * `SessionRegistry`. The capacity mirrors the resident FIFO: `limit`
+   * `ModelAdmissionLane`. The capacity mirrors the resident FIFO: `limit`
    * waiters plus one owner/runner. Callers retain the permit through every
    * pre-lock await; registration synchronously transfers it into the resident
-   * `SessionRegistry` budget before any later arrival can spend that capacity.
+   * `ModelAdmissionLane` budget before any later arrival can spend that capacity.
    */
   beginRequestLoadAdmission(modelId: string): ModelLoadAdmission {
     const limit = this.maxRequestLoadQueueDepth;
@@ -188,7 +193,7 @@ export class ModelWorkCoordinator {
    * permit moves into the registry before a later arrival can be admitted
    * against an apparently empty resident budget.
    */
-  bindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void {
+  bindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void {
     this.residentRegistriesByModel.set(modelId, registry);
     const admissions = this.requestLoadAdmissionsByModel.get(modelId);
     if (!admissions) return;
@@ -205,13 +210,13 @@ export class ModelWorkCoordinator {
   }
 
   /** Forget a name only when it still points at the supplied binding. */
-  unbindRequestLoadAdmissions(modelId: string, registry: SessionRegistry): void {
+  unbindRequestLoadAdmissions(modelId: string, registry: ModelAdmissionLane): void {
     if (this.residentRegistriesByModel.get(modelId) === registry) {
       this.residentRegistriesByModel.delete(modelId);
     }
   }
 
-  private transferAdmission(state: ModelLoadAdmissionState, registry: SessionRegistry): PreDispatchAdmission {
+  private transferAdmission(state: ModelLoadAdmissionState, registry: ModelAdmissionLane): PreDispatchAdmission {
     if (state.released) {
       throw new Error('Model load admission has already been released');
     }
@@ -290,8 +295,8 @@ export class ModelWorkCoordinator {
    * @param label Optional identifier (normally the model name) stamped into
    *   {@link lastLoad} so `/health` can name what was being loaded.
    */
-  async withModelLoad<T>(fn: () => Promise<T> | T, label?: string): Promise<T> {
-    await this.acquireWrite();
+  async withModelLoad<T>(fn: () => Promise<T> | T, label?: string, signal?: AbortSignal): Promise<T> {
+    await this.acquireWrite(signal);
     // Measured from lock acquisition, not from arrival: `startedAt` is meant
     // to answer "how long has the actual materialization been running",
     // which is what a supervisor deciding whether to wait needs.
@@ -324,7 +329,11 @@ export class ModelWorkCoordinator {
    * 60-second cold-load does not look like 60 seconds of own work for
    * every concurrent request.
    */
-  async withModelLoadInstrumented<T>(fn: () => Promise<T> | T, label?: string): Promise<ModelLoadOutcome<T>> {
+  async withModelLoadInstrumented<T>(
+    fn: () => Promise<T> | T,
+    label?: string,
+    signal?: AbortSignal,
+  ): Promise<ModelLoadOutcome<T>> {
     // `owner` MUST be decided synchronously, before any await, so the
     // signal reflects coordinator state at arrival rather than after
     // any peer transition. The wait/own split is measured around the
@@ -333,7 +342,7 @@ export class ModelWorkCoordinator {
     // elapsed time — see `ModelLoadOutcome` for the contract.
     const owner = !this.writerHeld && this.queuedWriters === 0;
     const arrivedAt = Date.now();
-    await this.acquireWrite();
+    await this.acquireWrite(signal);
     const lockAcquiredAt = Date.now();
     let ok = false;
     let failure: unknown;
@@ -353,8 +362,8 @@ export class ModelWorkCoordinator {
     }
   }
 
-  async withInference<T>(fn: () => Promise<T> | T): Promise<T> {
-    await this.acquireRead();
+  async withInference<T>(fn: () => Promise<T> | T, signal?: AbortSignal): Promise<T> {
+    await this.acquireRead(signal);
     try {
       return await fn();
     } finally {
@@ -362,32 +371,65 @@ export class ModelWorkCoordinator {
     }
   }
 
-  private acquireRead(): Promise<void> {
+  private acquireRead(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     if (!this.writerHeld && this.queuedWriters === 0) {
       this.activeReaders += 1;
       return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-      this.readerWaiters.push(() => {
-        this.activeReaders += 1;
-        resolve();
-      });
-    });
+    return this.parkWaiter(this.readerWaiters, () => {
+      this.activeReaders += 1;
+    }, signal);
   }
 
-  private acquireWrite(): Promise<void> {
+  private acquireWrite(signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted();
     this.queuedWriters += 1;
     if (!this.writerHeld && this.activeReaders === 0) {
       this.queuedWriters -= 1;
       this.writerHeld = true;
       return Promise.resolve();
     }
-    return new Promise<void>((resolve) => {
-      this.writerWaiters.push(() => {
+    return this.parkWaiter(
+      this.writerWaiters,
+      () => {
         this.queuedWriters -= 1;
         this.writerHeld = true;
+      },
+      signal,
+      () => {
+        this.queuedWriters -= 1;
+      },
+    );
+  }
+
+  /**
+   * Queue `grant` on `queue`, rejecting on `signal` abort. An aborted waiter
+   * is removed from the queue — via `onDequeue` bookkeeping — so it neither
+   * holds a slot nor wakes up dead.
+   */
+  private parkWaiter(
+    queue: Array<() => void>,
+    grant: () => void,
+    signal?: AbortSignal,
+    onDequeue?: () => void,
+  ): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const entry = () => {
+        signal?.removeEventListener('abort', onAbort);
+        grant();
         resolve();
-      });
+      };
+      const onAbort = () => {
+        const index = queue.indexOf(entry);
+        if (index >= 0) {
+          queue.splice(index, 1);
+          onDequeue?.();
+        }
+        reject(signal?.reason ?? new Error('Request aborted'));
+      };
+      queue.push(entry);
+      signal?.addEventListener('abort', onAbort, { once: true });
     });
   }
 
