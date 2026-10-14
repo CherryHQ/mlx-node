@@ -1,7 +1,9 @@
+import { spawn } from 'node:child_process';
+
 import { describe, expect, it, vi } from 'vite-plus/test';
 
 import { detectionCases, selectedText } from '../../../evals/agent-installed/cases.js';
-import { cliInvocation, JsonLines } from '../../../evals/agent-installed/cli.js';
+import { AgentCli, cliInvocation, JsonLines } from '../../../evals/agent-installed/cli.js';
 import { evaluateCase, grade, summarize } from '../../../evals/agent-installed/evaluate.js';
 import { physicalFootprint } from '../../../evals/agent-installed/process-memory.js';
 import { evalOptions } from '../../../scripts/eval-agent-installed.js';
@@ -107,10 +109,20 @@ describe('agent-installed eval oracle and execution', () => {
     expect(complete.mock.calls[0][2][0].content).toBe(detectionMessage(override.override!, override.command));
   });
 
-  it('uses the real CLI without overriding runtime defaults', () => {
+  it('uses the real agent binary without overriding runtime defaults', () => {
     expect(evalOptions(['--entrypoint', 'app']).entrypoint).toBe('app');
-    expect(cliInvocation('/repo', 'agent')).toEqual(['/repo/packages/cli/dist/cli.js', 'agent', '--mode', 'rpc']);
-    expect(cliInvocation('/repo', 'delegate')).toEqual(['/repo/packages/cli/dist/cli.js', 'delegate', '--mode', 'rpc']);
+    const agent = cliInvocation('/repo', 'agent');
+    const delegate = cliInvocation('/repo', 'delegate');
+    for (const argv of [agent, delegate]) {
+      expect(argv).toContain('--prompt-file');
+      expect(argv).toContain('streaming-messages-json');
+      expect(argv).not.toContain('--mode');
+    }
+    // The delegate entrypoint carries its production worker profile; the
+    // agent entrypoint gets only a non-interactive permission mode.
+    expect(delegate).toContain('--system-prompt-override');
+    expect(agent).not.toContain('--system-prompt-override');
+    expect(agent).toEqual(expect.arrayContaining(['--permission-mode', 'auto']));
     expect(() => evalOptions(['--model', 'replacement'])).toThrow();
     expect(() => evalOptions(['--thinking', 'off'])).toThrow();
     expect(() => evalOptions(['--entrypoint', 'serve'])).toThrow();
@@ -131,15 +143,60 @@ describe('agent-installed eval oracle and execution', () => {
     expect(physicalFootprint('Permission denied')).toBeUndefined();
   });
 
-  it('keeps RPC events intact across byte boundaries and Unicode line separators', () => {
+  it('refuses to start after close() so no serve child escapes the memoized shutdown', async () => {
+    const cli = new AgentCli('/repo', 'agent', '/tmp/workspace', '/tmp/output');
+    const closed = cli.close();
+    // The runner memoizes close(); a late start() must throw instead of
+    // spawning a serve child the already-resolved promise would never kill.
+    await expect(cli.start()).rejects.toThrow('Evaluation stopped.');
+    await closed;
+  });
+
+  it('close() outwaits a stalled agent child instead of clearing the hard-kill timer on serve exit', async () => {
+    const cli = new AgentCli('/repo', 'agent', '/tmp/workspace', '/tmp/output');
+    const serve = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => process.exit(0)); setInterval(() => {}, 1000)']);
+    const agent = spawn(process.execPath, ['-e', 'process.on("SIGTERM", () => setTimeout(() => process.exit(0), 400)); setInterval(() => {}, 1000)']);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    Object.assign(cli, { child: serve, active: { child: agent, reject: () => {} } });
+    const events: string[] = [];
+    serve.once('close', () => events.push('serve'));
+    agent.once('close', () => events.push('agent'));
+    try {
+      await cli.close();
+    } finally {
+      serve.kill('SIGKILL');
+      agent.kill('SIGKILL');
+    }
+    // The 400ms-stalled agent must close before close() resolves — previously
+    // serve's prompt exit cleared the SIGKILL fallback and returned early.
+    expect(events).toEqual(['serve', 'agent']);
+  });
+
+  it('close() resolves when a child already exited by signal (exitCode stays null)', async () => {
+    const cli = new AgentCli('/repo', 'agent', '/tmp/workspace', '/tmp/output');
+    const serve = spawn(process.execPath, ['-e', 'process.kill(process.pid, "SIGKILL")']);
+    await new Promise((resolve) => serve.once('close', resolve));
+    expect(serve.exitCode).toBeNull();
+    expect(serve.signalCode).toBe('SIGKILL');
+    Object.assign(cli, { child: serve });
+    // A signal-only termination must not wait for a 'close' that already fired.
+    await expect(
+      Promise.race([
+        cli.close(),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('close() hung on signal-killed child')), 3000)),
+      ]),
+    ).resolves.toBeUndefined();
+  });
+
+  it('keeps stream-json events intact across byte boundaries and Unicode line separators', () => {
     const receive = vi.fn();
     const stream = new JsonLines(receive);
     const event = {
-      type: 'message_end',
+      type: 'assistant',
       message: { role: 'assistant', content: [{ type: 'text', text: '中\u2028文\u2029é' }] },
     };
-    const bytes = Buffer.from(JSON.stringify(event) + '\n' + JSON.stringify({ type: 'agent_settled' }) + '\r\n');
+    const bytes = Buffer.from(JSON.stringify(event) + '\n' + JSON.stringify({ type: 'result' }) + '\r\n');
     for (const byte of bytes) stream.push(Buffer.from([byte]));
-    expect(receive.mock.calls).toEqual([[event], [{ type: 'agent_settled' }]]);
+    expect(receive.mock.calls).toEqual([[event], [{ type: 'result' }]]);
   });
 });

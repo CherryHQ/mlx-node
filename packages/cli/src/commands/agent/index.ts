@@ -7,7 +7,7 @@
  * HTTP to `mlx serve`. This command's whole job:
  *
  *   1. lift mlx-owned flags out of argv (`--models-dir`, tracing, help,
- *      the blocked `update` positional),
+ *      the mlx-owned `update` positional),
  *   2. make sure at least one local model exists (first-run wizard),
  *   3. spawn `mlx serve --port 0 --auth-token <tok>` + the agent binary,
  *      pointed at the real port via `GROK_*_BASE_URL`/`XAI_API_KEY`
@@ -18,17 +18,25 @@
  * forwards the rest verbatim.
  */
 
-import { chmodSync, closeSync, mkdirSync, openSync, readFileSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, mkdirSync, openSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 
 // Native-free subpaths: the help path must print without loading the addon, and
 // the family list must have exactly ONE definition (the drift guard's).
 import { CHAT_FAMILY_IDS, coldTierRestoreFamilyList } from '@mlx-node/agent/catalog';
-import { expandPiAgentDir } from '@mlx-node/agent/paths';
-import { launchGrokAgent, type GrokAgentLaunchOptions } from './grok-build.js';
+import { readAgentDefaultModel } from '@mlx-node/agent/paths';
 
-export { expandPiAgentDir } from '@mlx-node/agent/paths';
+import {
+  agentUpdateStatus,
+  applyAgentUpdate,
+  launchGrokAgent,
+  type AgentUpdateDeps,
+  type AgentUpdateStatus,
+  type GrokAgentLaunchOptions,
+} from './grok-build.js';
+
+export { expandAgentDir } from '@mlx-node/agent/paths';
 
 export interface AgentArgScan {
   /** Value of `--models-dir` (the flag pair is removed from `passthrough`). */
@@ -55,13 +63,14 @@ export interface AgentArgScan {
    * those pass through untouched).
    */
   help: boolean;
-  /** Leading `update` positional — the binary's self-update, always blocked. */
+  /** Leading `update` positional — intercepted by `run()` for the mlx-owned release download. */
   update: boolean;
   /**
    * The binary answers these BEFORE model resolution and exits — they need no
    * inference server: `--version`/`-v`, or any leading subcommand other than
-   * the interactive default (see {@link GROK_SUBCOMMANDS}). The launcher skips
-   * spawning `mlx serve` for them.
+   * the interactive default (see {@link GROK_SUBCOMMANDS}), plus `agent`
+   * itself when `-h`/`--help` follows (its help also exits early). The
+   * launcher skips spawning `mlx serve` for them.
    */
   grokOneShot: boolean;
   /** Args forwarded to the agent binary in their original order. */
@@ -73,7 +82,7 @@ export interface AgentArgScan {
  * except `agent` (ACP server) is a local metadata operation that never needs a
  * running model — the launcher skips the inference host for them. `update`
  * also lands here so the leading-positional rule is one table; `run()`
- * intercepts it before the handoff.
+ * intercepts it for the managed download before the handoff.
  */
 const GROK_SUBCOMMANDS: ReadonlySet<string> = new Set([
   'agent',
@@ -303,7 +312,7 @@ export function scanAgentArgs(argv: string[]): AgentArgScan {
     persistPagedCache,
     help: helpSeen && !isSubcommand,
     update: leadingCommand === 'update',
-    grokOneShot: versionSeen || (isSubcommand && leadingCommand !== 'agent'),
+    grokOneShot: versionSeen || (isSubcommand && (leadingCommand !== 'agent' || helpSeen)),
     passthrough,
   };
 }
@@ -328,7 +337,10 @@ export interface AgentTracingSetupOptions {
  * serve` loads the addon. Env is exported into THIS process so the serve
  * subprocess inherits it.
  */
-export function configureAgentTracing(scan: Pick<AgentArgScan, 'trace' | 'traceDir'>, options: AgentTracingSetupOptions = {}): string | undefined {
+export function configureAgentTracing(
+  scan: Pick<AgentArgScan, 'trace' | 'traceDir'>,
+  options: AgentTracingSetupOptions = {},
+): string | undefined {
   const env = options.env ?? process.env;
   const requested = scan.trace || scan.traceDir !== undefined;
   if (!requested) return undefined;
@@ -426,19 +438,12 @@ export interface PersistedGrokDefault {
 
 /**
  * Read the persisted `[models] default = "…"` the binary wrote to
- * `~/.mlx-agent/config.toml` (its `/model` picker persists there). Minimal
- * line scan — TOML parsing is not worth a dependency for one key.
+ * `~/.mlx-agent/config.toml` (its `/model` picker persists there) via the
+ * shared reader in `@mlx-node/agent/paths`.
  */
 export function readPersistedDefaultModel(agentDir?: string): PersistedGrokDefault | undefined {
-  try {
-    const dir = agentDir ?? process.env.GROK_HOME ?? join(homedir(), '.mlx-agent');
-    const text = readFileSync(join(dir, 'config.toml'), 'utf8');
-    const match = text.match(/^\s*default\s*=\s*"([^"]+)"/m);
-    if (!match?.[1]) return undefined;
-    return { modelId: match[1] };
-  } catch {
-    return undefined;
-  }
+  const modelId = readAgentDefaultModel(agentDir);
+  return modelId === undefined ? undefined : { modelId };
 }
 
 /**
@@ -487,6 +492,8 @@ Environment:
   MLX_AGENT_BIN             Path to a locally built agent binary (dev override;
                             default: <repo>/grok-build/target/release/mlx-agent,
                             then the prebuilt download under ~/.mlx-node/bin).
+  MLX_AGENT_TAG             Pin the release tag 'mlx agent update' installs and
+                            downloads resolve (default: newest published).
   MLX_CLI_ENTRY             Path to this CLI's entry point, used to spawn the
                             inference host (default: the running 'mlx' bin).
   MLX_NODE_LOG              Override the Rust tracing target filter used by --trace.
@@ -496,8 +503,9 @@ Notes:
   The agent binary is the forked Grok Build TUI. It discovers models from the
   spawned inference host's /v1/models and speaks the Anthropic Messages wire
   protocol (/v1/messages) — the same path 'mlx launch claude' uses.
-  'mlx agent update' is disabled — update @mlx-node/cli via your package
-  manager instead. Subcommands (models, sessions, export, doctor, mcp, plugin,
+  'mlx agent update' downloads the newest mlx-agent release into
+  ~/.mlx-node/bin (shadowed by MLX_AGENT_BIN or a vendored build; --check
+  reports status as JSON). Subcommands (models, sessions, export, doctor, mcp, plugin,
   memory, config, leader, login, logout, setup, share, usage, wrap, trace)
   pass through to the binary and run without the inference host.
 
@@ -526,6 +534,12 @@ export interface AgentRunDeps {
   wizard?: (modelsDir: string) => Promise<void>;
   /** Persisted-default reader; production = {@link readPersistedDefaultModel}. */
   readPersistedDefault?: typeof readPersistedDefaultModel;
+  /** `mlx agent update --check`: report-only probe (no download). */
+  updateStatus?: (deps: AgentUpdateDeps) => Promise<AgentUpdateStatus>;
+  /** `mlx agent update`: download + install into the managed cache. */
+  applyUpdate?: (deps: AgentUpdateDeps) => Promise<{ status: AgentUpdateStatus; downloaded: boolean }>;
+  /** Update-flow seams forwarded to both update functions (test-only). */
+  updateDeps?: AgentUpdateDeps;
 }
 
 /** Production wizard step: interactive catalog pick + download. */
@@ -551,12 +565,61 @@ async function discoverModelNames(modelsDir: string): Promise<{ name: string }[]
   return models.map((m) => ({ name: m.name }));
 }
 
+const PINNED_NOTICE: Readonly<Partial<Record<AgentUpdateStatus['pinned'], string>>> = {
+  env: 'the installed release stays unused while MLX_AGENT_BIN points elsewhere',
+  vendored: 'the installed release stays unused while grok-build/target/release/mlx-agent exists',
+};
+
+/**
+ * `mlx agent update [--check]`: mlx-owned self-update. The fork binary's own
+ * `update` subcommand was built for npm-style installs and can only corrupt a
+ * download-managed binary, so the positional is intercepted here instead of
+ * forwarded. `--check` emits the machine-readable status the desktop tray
+ * consumes; an install run on a piped stdout also ends with the same status
+ * JSON as its last line — without it the tray's parse resolves to {} and
+ * reports "Up to Date" even when a fallback install still trails latest.
+ */
+async function runAgentUpdate(scan: AgentArgScan, deps: AgentRunDeps): Promise<void> {
+  // scan.help stays false for subcommand argv, so read the passthrough directly.
+  if (scan.passthrough.includes('--help') || scan.passthrough.includes('-h')) {
+    console.log('Usage: mlx agent update [--check]\n\n  --check   print update status as JSON and exit');
+    return;
+  }
+  const updateDeps = deps.updateDeps ?? {};
+  const checkOnly = scan.passthrough.includes('--check');
+  try {
+    if (checkOnly) {
+      const status = await (deps.updateStatus ?? agentUpdateStatus)(updateDeps);
+      console.log(JSON.stringify(status));
+      return;
+    }
+    const { status, downloaded } = await (deps.applyUpdate ?? applyAgentUpdate)(updateDeps);
+    if (downloaded) {
+      // current is the tag that actually installed — a candidate fallback
+      // may have landed an older release than latest.
+      console.log(`mlx agent: updated to ${status.current ?? status.latest} → ${status.managedPath}`);
+      if (status.updateAvailable) {
+        console.warn(`mlx agent: warning — latest ${status.latest} could not be fetched; installed ${status.current}`);
+      }
+    } else {
+      console.log(`mlx agent: already up to date (${status.latest})`);
+    }
+    const pin = PINNED_NOTICE[status.pinned];
+    if (pin !== undefined) console.warn(`mlx agent: warning — ${pin}`);
+    // Piped consumers (the desktop updater) parse the LAST stdout line;
+    // interactive terminals get the human lines above only.
+    if (!process.stdout.isTTY) console.log(JSON.stringify(status));
+  } catch (error) {
+    console.error(`mlx agent: update failed — ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
+}
+
 export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void> {
   const scan = scanAgentArgs(argv);
 
   if (scan.update) {
-    console.error('mlx agent update is not supported; update @mlx-node/cli via your package manager instead');
-    process.exitCode = 1;
+    await runAgentUpdate(scan, deps);
     return;
   }
 
@@ -629,5 +692,6 @@ export async function run(argv: string[], deps: AgentRunDeps = {}): Promise<void
   process.exitCode = await launch({
     argv: agentArgv,
     modelsDir,
+    needsServer: true,
   });
 }

@@ -15,7 +15,7 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -87,6 +87,32 @@ for (const file of NATIVE_FILES) {
   cpSync(payload.native[file], join(stagedNative, file));
 }
 
+// The prebuilt grok-build fork binary. `mlx agent` probes
+// Contents/Resources/native/mlx-agent at runtime, so bundling it here means a
+// packaged install never hits the download path. Release packaging (--sign)
+// REQUIRES it — fetch-agent.ts stages it into out/agent first — while local
+// unsigned packages may skip it and fall back to a runtime download.
+const agentSrc = process.env.MLX_AGENT_PATH ?? join(OUT, 'agent', 'mlx-agent');
+if (existsSync(agentSrc)) {
+  cpSync(agentSrc, join(stagedNative, 'mlx-agent'));
+  chmodSync(join(stagedNative, 'mlx-agent'), 0o755);
+  // The release-tag marker travels with the binary: it is how `mlx agent
+  // update` and the tray's agent-update entry tell "bundled 0.2.0" apart
+  // from a newer managed download. fetch-agent.ts writes it for free.
+  const agentTagSrc = `${agentSrc}.tag`;
+  if (existsSync(agentTagSrc)) {
+    cpSync(agentTagSrc, join(stagedNative, 'mlx-agent.tag'));
+  } else {
+    console.warn(`no ${agentTagSrc} — bundled agent reports as unversioned to update checks`);
+  }
+  console.log(`bundled mlx-agent from ${agentSrc}`);
+} else if (sign) {
+  console.error(`\nno mlx-agent at ${agentSrc}\n\n  run: yarn oxnode packages/desktop/scripts/fetch-agent.ts\n`);
+  process.exit(1);
+} else {
+  console.log('no mlx-agent found — packaging without it (runtime download fallback)');
+}
+
 // Two fixups on the staged copy, BEFORE packager or codesign sees it. Both are
 // permanent properties of the artifact napi produces, verified on a real build:
 //
@@ -116,24 +142,12 @@ run('install_name_tool', [
   `@rpath/${keyringBinary}`,
   join(STAGE_APP, 'node_modules', '@napi-rs', 'keyring-darwin-arm64', keyringBinary),
 ]);
-// The dashboard's delegate token counter imports `tokenizers` lazily, and
-// stage-app ships exactly one slice of it (see the copy filter there). Its
-// upstream LC_ID_DYLIB carries the publisher's CI path —
-// /Users/runner/work/tokenizers/tokenizers/bindings/node/target/…/libnode.dylib —
-// which is the same defect mlx-core and keyring arrive with, and step [3/5] of
-// verify-bundle refuses it. Rewrite the staged copy, before packager/codesign.
-const tokenizersBinary = 'tokenizers.darwin-arm64.node';
-run('install_name_tool', [
-  '-id',
-  `@rpath/${tokenizersBinary}`,
-  join(STAGE_APP, 'node_modules', 'tokenizers', tokenizersBinary),
-]);
 console.log(`staged ${staged.externalCount} external + ${staged.workspaceCount} workspace packages`);
 console.log(`  pruned ${staged.prunedDirs} examples/docs/test dirs from staged packages`);
 console.log(`  pruned ${staged.prunedFiles} .d.ts / source-map / tsbuildinfo files`);
 if (staged.excludedProviderSdk.length > 0) {
   console.log(
-    `  excluded ${staged.excludedProviderSdk.join(', ')} — cloud LLM SDKs, unreachable without a pi-ai stream()`,
+    `  excluded ${staged.excludedProviderSdk.join(', ')} — cloud LLM SDKs, unreachable from a local-inference app`,
   );
 }
 if (staged.prunedNested.length > 0) {

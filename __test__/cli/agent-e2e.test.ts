@@ -2,21 +2,20 @@
  * Gated end-to-end smoke for `mlx agent`: spawns the REAL built CLI as a
  * SUBPROCESS and asserts it produces a model answer, fully offline.
  *
- * Why a subprocess and not in-process `runAgent`: pi's `main()` calls
- * `process.exit()` on the print path, so driving it in-process would tear
- * down the test worker. The subprocess is exactly what a user runs —
- * `node packages/cli/dist/cli.js agent …` — with stdin ignored so the pi
+ * Why a subprocess and not in-process `run()`: the spawned agent binary is
+ * an interactive TUI, so driving it in-process would tear down the test
+ * worker. The subprocess is exactly what a user runs —
+ * `node packages/cli/dist/cli.js agent …` — with stdin ignored so the agent
  * print-mode wrapper never blocks reading it.
  *
- * Availability convention (mirrors `packages/agent/__test__/provider-live.test.ts`):
- * the smallest local qwen3.5 checkpoint, overridable via
- * `MLX_AGENT_TEST_MODEL`. Skips cleanly when no candidate model exists
+ * Availability convention: the smallest local qwen3.5 checkpoint,
+ * overridable via `MLX_AGENT_TEST_MODEL`. Skips cleanly when no candidate model exists
  * (CI has none) or when the CLI has not been built. GPU work never runs
  * concurrently — the suite already pins `maxWorkers`/`maxConcurrency` to 1.
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -51,7 +50,7 @@ interface CliResult {
 
 function runCli(args: string[], env: NodeJS.ProcessEnv): Promise<CliResult> {
   return new Promise((resolve, reject) => {
-    // stdin 'ignore' → the pi print-mode wrapper sees EOF immediately and
+    // stdin 'ignore' → the agent's print-mode sees EOF immediately and
     // never blocks reading stdin.
     const child = spawn(process.execPath, [CLI_ENTRY, ...args], {
       cwd: REPO_ROOT,
@@ -92,6 +91,9 @@ describe.skipIf(!MODEL_PATH || !existsSync(CLI_ENTRY))('mlx agent CLI e2e smoke'
 
   beforeAll(async () => {
     agentDir = await mkdtemp(join(tmpdir(), 'mlx-agent-e2e-'));
+    // An empty config.toml marks the fork's home as initialized — a truly
+    // empty GROK_HOME makes single-mode exit silently on its first run.
+    await writeFile(join(agentDir, 'config.toml'), '');
   });
 
   afterAll(async () => {
@@ -110,16 +112,18 @@ describe.skipIf(!MODEL_PATH || !existsSync(CLI_ENTRY))('mlx agent CLI e2e smoke'
           'agent',
           '--models-dir',
           modelsDir,
+          // Model ids are the names /v1/models reports — the same bare name
+          // withDefaultModel injects on a fresh interactive run.
           '--model',
-          `mlx/${modelId}`,
+          modelId,
           '-p',
           `Reply with exactly: ${EXPECTED}`,
-          '--no-session',
         ],
         {
           ...process.env,
           MLX_AGENT_AUTO_APPROVE: '1',
-          PI_CODING_AGENT_DIR: agentDir,
+          // The fork's session/config home — keeps this run hermetic.
+          GROK_HOME: agentDir,
         },
       );
 

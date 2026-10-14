@@ -22,11 +22,27 @@ import { join } from 'node:path';
 import { discoverLocalChatModels } from '@mlx-node/lm/model-discovery';
 import { engineEnvFor, LAUNCHER_ENGINE_POLICY } from '@mlx-node/server/host/env-policy';
 import { resolveModelsDirAsync } from '@mlx-node/server/host/paths';
-import { app, autoUpdater, clipboard, Menu, screen, type MenuItemConstructorOptions, type WebContents } from 'electron';
+import {
+  app,
+  autoUpdater,
+  clipboard,
+  Menu,
+  screen,
+  utilityProcess,
+  type MenuItemConstructorOptions,
+  type WebContents,
+} from 'electron';
 import electronUpdater from 'electron-updater';
 
 import { createCliLauncher, type DesktopCliConfig } from '../cli-launcher.js';
 import { DESKTOP_QUIT_DEADLINE_MS } from '../control-panel/shutdown-timings.js';
+import {
+  collectAgentUpdateResult,
+  createAgentUpdater,
+  presentAgentUpdate,
+  type AgentUpdateCheck,
+  type AgentUpdater,
+} from './agent-updates.js';
 import { decideAutoStart } from './auto-start.js';
 import { createControlPanelBroker, type ControlPanelBroker } from './broker.js';
 import { controlPanelEnvOverrides, sidecarEnvOverrides } from './child-env.js';
@@ -67,6 +83,7 @@ let tray: TrayController | null = null;
 let controlPanel: ControlPanelWindowManager | null = null;
 let broker: ControlPanelBroker<WebContents> | null = null;
 let updates: DesktopUpdater | null = null;
+let agentUpdates: AgentUpdater | null = null;
 const launchVisibility = createLaunchVisibility();
 
 /**
@@ -148,6 +165,7 @@ function wire(): void {
         // Set before closing windows so their close handler allows a real exit.
         quitting = true;
         updates?.stop();
+        agentUpdates?.stop();
         launchVisibility.beginShutdown();
       },
       shutdown,
@@ -200,6 +218,7 @@ async function bootstrap(): Promise<void> {
         submenu: [
           { role: 'about' },
           { id: 'app-update', ...presentUpdate('disabled'), click: updateApp },
+          { id: 'agent-update', ...presentAgentUpdate('idle'), click: updateAgent },
           { type: 'separator' },
           { role: 'services' },
           { type: 'separator' },
@@ -261,6 +280,17 @@ async function bootstrap(): Promise<void> {
     onChange: refreshUpdates,
     requestQuit: () => app.quit(),
     report: (error) => console.error('[mlx] update:', error),
+  });
+
+  // The agent binary ships from the grok-build fork on its own release
+  // cadence, outside the app bundle's update feed. Check/install go through
+  // `mlx agent update` in a utilityProcess — MAIN must never wait on the
+  // network — and the downloaded binary lands in the managed cache
+  // (~/.mlx-node/bin), which shadows the bundled one on the next launch.
+  agentUpdates = createAgentUpdater({
+    run: (args) => runAgentUpdateCli(paths?.cliEntry ?? '', args),
+    onChange: refreshAgentUpdates,
+    report: (error) => console.error('[mlx] agent update:', error),
   });
 
   supervisor = createSupervisor({
@@ -406,6 +436,7 @@ async function bootstrap(): Promise<void> {
     iconPath: paths.trayIcon,
     showInDock: () => settings.showInDock,
     appUpdate: () => presentUpdate(updates?.status() ?? 'disabled', updates?.progress()),
+    agentUpdate: () => presentAgentUpdate(agentUpdates?.status() ?? 'idle', agentUpdates?.latest() ?? null),
     actions: {
       openControlPanel: () => controlPanel?.show(),
       startInference: () => {
@@ -429,10 +460,12 @@ async function bootstrap(): Promise<void> {
         app.quit();
       },
       updateApp,
+      updateAgent,
     },
   });
   refreshTray();
   updates.start();
+  agentUpdates?.start();
 
   // Auto-start is gated on there being something to serve: a fresh install
   // has no models, and forking INFERENCE there is a guaranteed
@@ -508,6 +541,12 @@ function updateApp(): void {
   else updates?.check();
 }
 
+function updateAgent(): void {
+  if (quitting) return;
+  if (agentUpdates?.status() === 'available') agentUpdates.install();
+  else agentUpdates?.check();
+}
+
 function refreshUpdates(): void {
   const item = Menu.getApplicationMenu()?.getMenuItemById('app-update');
   if (item !== null && item !== undefined) {
@@ -516,6 +555,31 @@ function refreshUpdates(): void {
     item.enabled = presentation.enabled;
   }
   refreshTray();
+}
+
+function refreshAgentUpdates(): void {
+  const item = Menu.getApplicationMenu()?.getMenuItemById('agent-update');
+  if (item !== null && item !== undefined) {
+    const presentation = presentAgentUpdate(agentUpdates?.status() ?? 'idle', agentUpdates?.latest() ?? null);
+    item.label = presentation.label;
+    item.enabled = presentation.enabled;
+  }
+  refreshTray();
+}
+
+/**
+ * `mlx agent update` inside a utilityProcess — Node-mode child, so `cli.js`
+ * runs directly. `--check` prints the status JSON on its last stdout line;
+ * install prints human text. The output collection (waiting for stdio to
+ * close, parsing the status) lives in `agent-updates.ts` so this file stays
+ * Electron plumbing only.
+ */
+function runAgentUpdateCli(cliEntry: string, args: string[]): Promise<AgentUpdateCheck> {
+  const child = utilityProcess.fork(cliEntry, ['agent', 'update', ...args], {
+    stdio: 'pipe',
+    serviceName: 'mlx-agent-update',
+  });
+  return collectAgentUpdateResult(child, args.includes('--check'));
 }
 
 /**

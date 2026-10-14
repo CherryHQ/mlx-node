@@ -10,7 +10,7 @@ import {
   type AgentRunDeps,
   chooseDefaultModel,
   configureAgentTracing,
-  expandPiAgentDir,
+  expandAgentDir,
   readPersistedDefaultModel,
   run,
   scanAgentArgs,
@@ -294,6 +294,16 @@ describe('scanAgentArgs', () => {
       expect(scan.passthrough).toEqual(['agent']);
     });
 
+    it('treats agent -h/--help as a one-shot — the binary prints subcommand help and exits', () => {
+      for (const argv of [['agent', '--help'], ['agent', '-h']]) {
+        const scan = scanAgentArgs(argv);
+        expect(scan.grokOneShot).toBe(true);
+        // Not mlx-level help: the binary prints the agent subcommand's own help.
+        expect(scan.help).toBe(false);
+        expect(scan.passthrough).toEqual(argv);
+      }
+    });
+
     it('detects a subcommand behind a stripped --models-dir pair', () => {
       const scan = scanAgentArgs(['--models-dir', '/x', 'models']);
       expect(scan.grokOneShot).toBe(true);
@@ -468,12 +478,7 @@ describe('withDefaultModel', () => {
       // --client-identifier consumes `-c` as its value (grok: args[++i]); the
       // benign reverse direction — the leftover run is a plain fresh run →
       // concrete -m.
-      expect(withDefaultModel(['--client-identifier', '-c'], 'd')).toEqual([
-        '-m',
-        'd',
-        '--client-identifier',
-        '-c',
-      ]);
+      expect(withDefaultModel(['--client-identifier', '-c'], 'd')).toEqual(['-m', 'd', '--client-identifier', '-c']);
     });
 
     it('still classifies a REAL option name after its consumer sentinel skips its own value', () => {
@@ -490,28 +495,28 @@ describe('withDefaultModel', () => {
 });
 
 /**
- * Compat re-export of pi 0.80.6 `getAgentDir` → `normalizePath` (default
- * options): lone `~` and leading `~/` expand, `file://` URLs resolve,
- * `~user` and everything else pass verbatim.
+ * Shared agent-dir expansion (re-exported from `@mlx-node/agent/paths`):
+ * lone `~` and leading `~/` expand, `file://` URLs resolve, `~user` and
+ * everything else pass verbatim.
  */
-describe('expandPiAgentDir', () => {
+describe('expandAgentDir', () => {
   it('expands a lone ~ and a leading ~/ against the home dir', () => {
-    expect(expandPiAgentDir('~', '/home/u')).toBe('/home/u');
-    expect(expandPiAgentDir('~/tilde-agent', '/home/u')).toBe(join('/home/u', 'tilde-agent'));
-    expect(expandPiAgentDir('~/a b/agent', '/home/u')).toBe(join('/home/u', 'a b/agent'));
+    expect(expandAgentDir('~', '/home/u')).toBe('/home/u');
+    expect(expandAgentDir('~/tilde-agent', '/home/u')).toBe(join('/home/u', 'tilde-agent'));
+    expect(expandAgentDir('~/a b/agent', '/home/u')).toBe(join('/home/u', 'a b/agent'));
   });
 
   it('does NOT expand ~user and passes other values verbatim', () => {
-    expect(expandPiAgentDir('~user/agent', '/home/u')).toBe('~user/agent');
-    expect(expandPiAgentDir('/abs/agent', '/home/u')).toBe('/abs/agent');
-    expect(expandPiAgentDir('relative/agent', '/home/u')).toBe('relative/agent');
+    expect(expandAgentDir('~user/agent', '/home/u')).toBe('~user/agent');
+    expect(expandAgentDir('/abs/agent', '/home/u')).toBe('/abs/agent');
+    expect(expandAgentDir('relative/agent', '/home/u')).toBe('relative/agent');
     // No trim: normalizePath default options leave whitespace alone, so a
     // padded value stays a literal (weird) path — parity over polish.
-    expect(expandPiAgentDir(' ~/padded', '/home/u')).toBe(' ~/padded');
+    expect(expandAgentDir(' ~/padded', '/home/u')).toBe(' ~/padded');
   });
 
   it('resolves file:// URLs', () => {
-    expect(expandPiAgentDir('file:///abs/agent', '/home/u')).toBe('/abs/agent');
+    expect(expandAgentDir('file:///abs/agent', '/home/u')).toBe('/abs/agent');
   });
 });
 
@@ -587,7 +592,7 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(0);
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', 'agent']);
-    expect(calls.launch[0]!.needsServer).toBeUndefined();
+    expect(calls.launch[0]!.needsServer).toBe(true);
     expect(calls.launch[0]!.modelsDir).toBe('/fake/models');
   });
 
@@ -709,12 +714,24 @@ describe('run() argv routing', () => {
     }
   });
 
-  it('still blocks update with exit code 1 before anything runs', async () => {
+  it('routes update to the mlx-owned updater before anything else runs', async () => {
     const { deps, calls } = makeDeps();
+    const applyUpdate = vi.fn(async () => ({
+      downloaded: false,
+      status: {
+        current: 'mlx-agent-v0.2.0',
+        latest: 'mlx-agent-v0.2.0',
+        updateAvailable: false,
+        managedPath: '/m/mlx-agent',
+        pinned: 'managed' as const,
+        newestInstalled: null,
+      },
+    }));
     const prevExitCode = process.exitCode;
     try {
-      await run(['update'], deps);
-      expect(process.exitCode).toBe(1);
+      await run(['update'], { ...deps, applyUpdate });
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
     } finally {
       process.exitCode = prevExitCode;
     }
@@ -723,12 +740,24 @@ describe('run() argv routing', () => {
     expect(calls.wizard).toHaveLength(0);
   });
 
-  it('still blocks update even when --version rides along', async () => {
+  it('still routes update to the updater even when --version rides along', async () => {
     const { deps, calls } = makeDeps();
+    const applyUpdate = vi.fn(async () => ({
+      downloaded: true,
+      status: {
+        current: 'mlx-agent-v0.3.0',
+        latest: 'mlx-agent-v0.3.0',
+        updateAvailable: false,
+        managedPath: '/m/mlx-agent',
+        pinned: 'managed' as const,
+        newestInstalled: null,
+      },
+    }));
     const prevExitCode = process.exitCode;
     try {
-      await run(['update', '--version'], deps);
-      expect(process.exitCode).toBe(1);
+      await run(['update', '--version'], { ...deps, applyUpdate });
+      expect(applyUpdate).toHaveBeenCalledOnce();
+      expect(process.exitCode).toBe(0);
     } finally {
       process.exitCode = prevExitCode;
     }
@@ -743,7 +772,18 @@ describe('run() argv routing', () => {
     expect(calls.launch).toHaveLength(1);
     expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '-p', 'hi']);
     expect(calls.launch[0]!.modelsDir).toBe('/fake/models');
-    expect(calls.launch[0]!.needsServer).toBeUndefined();
+    expect(calls.launch[0]!.needsServer).toBe(true);
+  });
+
+  it('keeps the server path when --help is the VALUE of --system-prompt-override', async () => {
+    // The launcher's one-shot decision must come from this routing, not a
+    // raw argv rescan: a `--help` in a value slot is data for the binary.
+    const { deps, calls } = makeDeps();
+    await run(['--system-prompt-override', '--help', '-p', 'hi'], deps);
+    expect(calls.discover).toHaveLength(1);
+    expect(calls.launch).toHaveLength(1);
+    expect(calls.launch[0]!.argv).toEqual(['-m', 'fake-model', '--system-prompt-override', '--help', '-p', 'hi']);
+    expect(calls.launch[0]!.needsServer).toBe(true);
   });
 
   it('forwards --models-dir to the launch options, stripped from argv', async () => {

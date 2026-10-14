@@ -80,10 +80,12 @@ import { createHash, createHmac, randomBytes } from 'node:crypto';
 import type { ChatConfig } from '@mlx-node/core';
 import { ChatSession, type SessionCapableModel } from '@mlx-node/lm';
 
+import { TurnTraceModel, type TurnTraceDeps } from './turn-trace.js';
+
 /**
  * Tier-2 `prompt_cache_key` reuse is **ON by default** so the server
- * is immediately compatible with any stateless LLM agent (pi-mono,
- * Aider, Codex CLI, Claude Code, Cline, Continue) that sends the full
+ * is immediately compatible with any stateless LLM agent
+ * (Aider, Codex CLI, Claude Code, Cline, Continue) that sends the full
  * transcript every turn. Agents that set OpenAI's standard
  * `prompt_cache_key` field — which most do — get automatic KV cache
  * reuse across turns of the same logical session.
@@ -337,6 +339,18 @@ export interface SessionRegistryOptions {
    * apply it after request mapping, before dispatching into native decode.
    */
   maxOutputTokens?: number;
+  /**
+   * Fallback model name for traces on turns the request did not stamp with
+   * an alias — a static name, or a resolver consulted per turn so the
+   * surviving alias wins when the binding outlives its first name.
+   */
+  modelName?: string | (() => string | undefined);
+  /**
+   * Test seams for the per-turn metrics-trace wrapper this registry installs
+   * on the model. Production callers leave it unset — the defaults read the
+   * native cold-tier counters and write to the standard trace directory.
+   */
+  traceDeps?: Omit<TurnTraceDeps, 'modelName'>;
 }
 
 /**
@@ -544,7 +558,11 @@ export class SessionRegistry {
   private readonly admissionWaiters: Array<() => void> = [];
 
   constructor(opts: SessionRegistryOptions) {
-    this.model = opts.model;
+    // Wrap the model ONCE so every `ChatSession` this registry allocates
+    // (warm slot, tier-2 hit, `createFreshSession`) dispatches through the
+    // per-turn trace recorder. This is the one funnel every serve-path turn
+    // — `/v1/responses` and `/v1/messages`, streaming or not — shares.
+    this.model = new TurnTraceModel(opts.model, { ...opts.traceDeps, modelName: opts.modelName });
     this.ttlSec = opts.ttlSec ?? 1800;
     this.maxQueueDepth = opts.maxQueueDepth;
     const requestedConcurrency = opts.maxConcurrentDispatches ?? 1;
@@ -828,7 +846,7 @@ export class SessionRegistry {
    *
    *   2. **Tier 2 — `promptCacheKey`.** Only runs when
    *      `previousResponseId` is `null`. Stateless agent clients
-   *      (pi-mono, Aider, Codex CLI, Continue, etc.) never use
+   *      (Aider, Codex CLI, Continue, etc.) never use
    *      `previous_response_id` — they own the conversation history
    *      client-side and resend the full transcript on every turn —
    *      so the only way to reuse a warm session across those turns
