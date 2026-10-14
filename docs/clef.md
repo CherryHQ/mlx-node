@@ -24,6 +24,73 @@ directory. The joint head itself must sit in affine ggml blocks (the
 published files keep every head weight in Q8_0); a K-quant head weight is
 rejected at conversion.
 
+### Residency
+
+A decide is one prefill forward, so each backbone weight is read once at
+`M = prompt length`. The loader therefore rewrites the quantized backbone
+projections at load time instead of running the checkpoint's packed matmul
+kernels:
+
+| Mode   | Storage after load                                       | GEMM route                             |
+| ------ | -------------------------------------------------------- | -------------------------------------- |
+| `sym8` | int8 `[N,K]` weight + f32 `[N]` per-output-channel scale | int8 W8A8 (per-token activation quant) |
+| `bf16` | dense bf16                                               | MLX bf16 GEMM                          |
+
+`sym8` is taken for a quantized checkpoint when the device can run the NAX
+tensor ops (M5-class GPUs on macOS 26.2 or later; the int8 kernels are
+`mpp::tensor_ops` with no dense fallback) and `bf16` otherwise (no NAX, or an
+unquantized checkpoint, which is left as stored). Measured on an M5 Max at
+the 9B and 27B CLEF projection shapes,
+the sym8 GEMM alone is 1.3-1.8x faster than the dense bf16 GEMM at every `M`
+from 128 to 1024, while every weight-only packed route (affine qmm, the tiled
+`a8g64@t64` / `q4k@t64` kernels, per-group W8A8) is slower than dense bf16
+from `M >= 256`. The cost is the per-token int8 activation quantization,
+which the rotation below keeps inside the acceptance gate.
+
+End to end on the published GGUFs (`ggml-org/Clef-GGUF` and
+`Clef-Flash-GGUF`, Q8_0, the six acceptance inputs, M5 Max, one process per
+run), against the bf16 real-weight results in
+[validation](validation/clef-real-weights.md):
+
+| Checkpoint    | Residency | Sum of 6 decides | Resident MLX memory | Max abs probability diff |
+| ------------- | --------- | ---------------: | ------------------: | -----------------------: |
+| Flash 9B Q8_0 | `bf16`    |           1.47 s |             19.2 GB |                   0.0012 |
+| Flash 9B Q8_0 | `sym8`    |           1.14 s |              9.3 GB |                   0.0071 |
+| CLEF 27B Q8_0 | `bf16`    |           8.60 s |             61.8 GB |                   0.0049 |
+| CLEF 27B Q8_0 | `sym8`    |           6.78 s |             27.3 GB |                   0.0047 |
+
+Every modal decision matched in every run. Without the rotation sym8 is
+another ~10% faster but the max diff rises to 0.038 (9B) / 0.015 (27B), over
+the 0.01 gate, so the rotation is always on. The Q4_K_M GGUFs are dominated
+by their weight quantization (0.08 on Flash even under `bf16`).
+
+The requantization uses the same routine as `mlx convert --q-mode sym8` and
+follows its ladder: 2-D weights with `K % 16 == 0`, excluding `in_proj_ba`
+(and the split `in_proj_b` / `in_proj_a` halves), which stays dense bf16.
+An MLP is decided as one unit: a dense sibling in the checkpoint or one
+ineligible member sends all three projections to bf16, because the MLP
+installs all-or-nothing. A projection the checkpoint already stores as sym8
+(`mlx convert --q-mode sym8`) is decoded to dense bf16, and its MLP with it:
+its one scale per row has already spent the error budget. Measured on the
+sym8 convert of Flash against the same bf16 reference, the max diff is 0.012
+served as stored (unrotated W8A8), 0.010 rotated and requantized, and 0.005
+dense — only dense passes the gate. This mirrors how mlx-lm treats a stored
+format it cannot serve to spec (fp8 checkpoints dequantize to bf16 at load).
+For sym8 speed on CLEF use the Q8_0 GGUF, which is both faster and inside
+the gate. The embedding and `lm_head` are never rewritten in either mode:
+the lookup and the joint head's row gather read packed rows directly.
+
+Each requantized projection whose input width `K` is a multiple of 1024 gets
+a QuaRot-style online Hadamard rotation: the dense weight is rotated along
+`K` in f32 (`W' = W · H_s`, `H_s` a signed 1024-block Walsh-Hadamard with a
+fixed sign vector derived from `K` alone) before the int8 quantizer, and the
+built projection applies the same transform to its activation before the
+W8A8 kernels, so `(x · H_s)(W · H_s)^T = x W^T` while the per-token int8
+activation quant sees outlier-spread rows. Sign vectors are deterministic
+per `K` (bit-identical across processes) and shared by every projection of
+one width. Projections with `K % 1024 != 0` requantize without rotation; the
+loader summary logs both counts.
+
 ## TypeScript
 
 ```ts
