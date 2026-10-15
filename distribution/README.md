@@ -19,6 +19,16 @@ addon before loading a model. Keep `mlx.metallib` and `paged_attn.metallib` next
 that addon. The host owns native downloads, model paths, process lifetime and audio
 playback. The native addon must match the pinned upstream source revision.
 
-Use the upstream `build:native` script to build native files separately. Publication
-of those files and an npm version is a separate, reviewed step; generating this
-package does not publish anything.
+Use the upstream `build:native` script in a clean checkout of the pinned revision
+to build native files separately. Package that checkout and the audited 8-bit model:
+
+```sh
+node scripts/package-cherry-native.mjs <pinned-checkout> <converted-model> <output>
+```
+
+This generates a native-only archive, model files and a checksum manifest for the
+fork's next artifact release. It requires `tar` to be available to Node. The old
+`r1` archive remains the application's download source until the `r2` artifacts
+are reviewed and published. Its unused JavaScript is excluded during extraction.
+Publication of native files and an npm version is a separate, reviewed step;
+neither packaging script publishes anything.
