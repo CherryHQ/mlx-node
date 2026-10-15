@@ -901,18 +901,19 @@ export class DownloadManager {
 
     let stagingDir: string | undefined;
     try {
-      // The no-follow ownership preflight, factored so it reads identically at both
+      // The occupancy preflight, factored so it reads identically at both
       // its call sites: a final dir the downloader does not own (a manual copy or an
-      // `mlx download` install with no completion marker, OR any symlink, which
-      // `isDownloaderOwned` rejects no-follow) is refused — so an unowned local
+      // `mlx download` install with no completion marker, a symlink into such an
+      // UNMARKED dir, or a dangling link — `isDownloaderOwned` follows the link and
+      // reads the TARGET's marker, so only a live link into an unmarked/absent
+      // target stays unowned) is refused — so an unowned local
       // checkpoint never triggers a full multi-GB download+hash only to be refused at
       // publish. It reads ONLY `finalDir`, so it is order-independent of the staging
       // root and the resolved revision. Run it (a) before backup recovery — the
-      // recovery reap classifies finalDir with `isModelInstalled`, which FOLLOWS
-      // symlinks, so a foreign `finalDir` link must be refused BEFORE recovery could
-      // follow it and reap a recoverable rollback backup — and (b) again after
-      // recovery, so a `finalDir` that recovery (or a race) restored to a foreign
-      // symlink is refused BEFORE skip-detection follows it. The publish-time checks
+      // recovery reap classifies finalDir no-follow (`lstat`), so a refused link
+      // never reaches it — and (b) again after
+      // recovery, so a `finalDir` that recovery (or a race) replaced is refused
+      // BEFORE skip-detection follows it. The publish-time checks
       // below still guard the narrow check-then-swap race for a dir that races in
       // after this point.
       const refuseIfUnownedFinal = (): void => {
@@ -950,9 +951,9 @@ export class DownloadManager {
       await this.recoverBackup(slug, finalDir);
 
       // Re-run the preflight after recovery: recovery restores only an owned real-dir
-      // backup, but this refuses any foreign symlink a race put at finalDir before
+      // backup, but this refuses any unowned occupant a race put at finalDir before
       // skip-detection (`readCompletion`/`isModelInstalled`, which FOLLOW symlinks)
-      // could read the foreign marker and report a false `done` through the link.
+      // could read an unowned dir's marker-free state and report a false `done`.
       refuseIfUnownedFinal();
 
       const at = ++this.resolveSeq;
@@ -1062,7 +1063,10 @@ export class DownloadManager {
         (job.repo !== QWEN38_DFLASH2.hfRepo || isDFlash2Companion(finalDir)) &&
         (sidecarPlan === null || (await this.refreshInstalledAssets(sidecarPlan, finalDir, files, installed)));
       // `refreshInstalledAssets` is the one pre-publish path that mutates the
-      // live install (stale-sidecar deletes, marker rewrite). A cancel accepted
+      // live install (stale-sidecar deletes, marker rewrite) — and only on a
+      // real dir: it refuses a symlinked install, so a needed refresh on a
+      // linked-in model re-downloads through the link-safe publish swap. A
+      // cancel accepted
       // during that await must still win over the done branch — and over the
       // fall-through below, which this single check also covers.
       if (job.cancelled) throw new Error('Download cancelled');
@@ -1238,22 +1242,28 @@ export class DownloadManager {
   /**
    * SLUG-SCOPED recover/reap of an orphaned publish backup for THIS model
    * (`<slug>.backup-<pid>.<uuid>`), gated by pid-liveness. Runs AFTER the ownership
-   * preflight (which already refused a foreign `finalDir` symlink), so nothing here
-   * follows such a link. A backup whose owner pid is still ALIVE belongs to a peer
-   * mid-publish and is never touched. For a dead-owner backup, classify finalDir
-   * NO-FOLLOW first — `isModelInstalled` alone FOLLOWS symlinks, so a live `finalDir`
-   * link into an external marked model would read as a complete install and REAP a
-   * recoverable rollback backup:
+   * preflight (which already refused an unowned `finalDir` occupant), so nothing
+   * here follows a foreign link into an unmarked dir. A backup whose owner pid is
+   * still ALIVE belongs to a peer mid-publish and is never touched. For a
+   * dead-owner backup, classify finalDir NO-FOLLOW first — `lstat` reports any
+   * `finalDir` symlink as not-a-directory, so a link into an external marked model
+   * can never be read as a complete install and REAP a recoverable rollback
+   * backup:
    *
    *   - finalDir is a proven owned-complete REAL dir → the backup is redundant → rm;
-   *   - finalDir is ABSENT (a crashed swap) AND the backup is itself an OWNED REAL
-   *     directory (no-follow: `lstat().isDirectory()` + our marker) → restore it by
-   *     renaming it back into place. A FOREIGN-SYMLINK backup is NEVER restored: a
-   *     prior `overwrite` publish could have renamed a symlinked finalDir to its
-   *     backup, and restoring that link at finalDir would let skip-detection follow
-   *     it and report a false `done` through the foreign target;
+   *   - finalDir is ABSENT (a crashed swap) AND the backup proves OWNED → restore
+   *     it by renaming it back into place. Ownership here is `isDownloaderOwned`,
+   *     which stat-FOLLOWS a symlink: an owned REAL dir and an owned LINK into a
+   *     marked install both roll back. Restoring the link is safe because the
+   *     publish swap can legitimately rename an admitted symlinked finalDir to its
+   *     backup — the rollback reinstates exactly what the ownership preflight
+   *     admitted — and post-restore skip-detection still re-reads the target's
+   *     marker against THIS job's repo+revision, so a link into a marked install
+   *     of a different model is just re-swapped aside, never reported `done`. A
+   *     FOREIGN-symlink backup (unmarked or dangling target) fails ownership and
+   *     is never promoted;
    *   - otherwise (foreign symlink / unowned dir / incomplete-owned dir, OR — with
-   *     finalDir absent — a non-owned/symlink backup) → RETAIN the backup untouched
+   *     finalDir absent — a non-owned backup) → RETAIN the backup untouched
    *     and never clobber whatever occupies finalDir. Never throws.
    */
   private async recoverBackup(slug: string, finalDir: string): Promise<void> {
@@ -1288,9 +1298,11 @@ export class DownloadManager {
       try {
         if (finalOwnedComplete) {
           await rm(backupPath, { recursive: true, force: true }); // redundant backup
-        } else if (finalAbsent && lstatSync(backupPath).isDirectory() && isDownloaderOwned(backupPath)) {
-          // Restore a crashed swap — but ONLY an owned REAL-directory backup, so a
-          // foreign-symlink backup is never promoted onto finalDir.
+        } else if (finalAbsent && isDownloaderOwned(backupPath)) {
+          // Restore a crashed swap. `isDownloaderOwned` stat-follows a symlink
+          // backup into the marked install it points at — the same proof that
+          // admitted that link as finalDir — so owned real dirs and owned links
+          // both roll back, while foreign/dangling links fail ownership.
           await rename(backupPath, finalDir);
         }
         // else foreign symlink / unowned dir / incomplete-owned → retain untouched
@@ -1436,6 +1448,14 @@ export class DownloadManager {
    *     verifies the bytes, finds them current, and used to return without
    *     recording that verification — the card offered the same update again.
    *
+   *   - a SYMLINKED `dir` is refused the refresh outright (returns false):
+   *     the deletions and the marker write follow the link and would mutate
+   *     the foreign target — the exact boundary `deleteLocalModel` draws by
+   *     unlinking only the link. Returning false sends the job down the full
+   *     download path, whose publish swap replaces the LINK with an owned real
+   *     directory (rename moves the link aside, `rm` unlinks it), so a needed
+   *     refresh still lands without ever writing into the external tree.
+   *
    * The deletions run BEFORE the marker is published, so an interrupted
    * refresh fails with the marker untouched and retries (see the ordering note
    * in the body).
@@ -1463,6 +1483,22 @@ export class DownloadManager {
     // repo forever — a badge update discovery can never clear.
     if (stale.length === 0 && installed.assetsRepo === plan.repo.name && installed.assetsRevision === plan.revision)
       return true;
+    // Everything past this line MUTATES `dir`. `lstat` (no-follow, same guard
+    // as `assertRealDirOrAbsent` and `recoverBackup`) refuses it when `dir` is
+    // a symlink into a marked external install: a live link is admitted as
+    // downloader-owned and a same-revision marker reads as current, so it
+    // reaches here — but nothing the downloader manages may write through it.
+    // Returning false re-downloads and publishes an owned real dir in the
+    // link's place; the external tree is never touched. A `dir` that vanished
+    // between the marker read and now takes the same path (a refresh cannot
+    // run on nothing, and publish handles the absent case).
+    let finalIsLink = false;
+    try {
+      finalIsLink = lstatSync(dir).isSymbolicLink();
+    } catch {
+      finalIsLink = true;
+    }
+    if (finalIsLink) return false;
     if (stale.length > 0) {
       // Pruning must never destroy the install. The resulting manifest has to
       // stay loadable — a config and a weight — and the case that matters is

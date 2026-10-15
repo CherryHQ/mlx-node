@@ -1440,6 +1440,76 @@ describe('DownloadManager', () => {
     expect(marker.assetsRevision).toBe(SHA_NEW);
   });
 
+  it('never writes through a LIVE final symlink during the sidecar refresh — the refresh re-downloads instead', async () => {
+    // Same-revision install whose marker records a sidecar the assets repo has
+    // since dropped (tokenizer.json) AND a stale assetsRevision: on a real dir
+    // the verified-done refresh would DELETE the stale sidecar and REWRITE the
+    // marker in place. With `<modelsDir>/<slug>` a live symlink into that
+    // external marked dir, those writes would land inside the foreign target —
+    // the exact boundary `deleteLocalModel` draws by unlinking only the link.
+    // The refresh must refuse the link; the job then takes the full download
+    // path whose publish swap replaces the LINK with an owned real directory.
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(external, 'tokenizer.json'), Buffer.alloc(20, 0xab));
+    writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
+    const externalMarker = join(external, DOWNLOAD_COMPLETE_MARKER);
+    writeFileSync(
+      externalMarker,
+      JSON.stringify({
+        repo: REPO,
+        revision: SHA_DEFAULT,
+        files: ['config.json', 'tokenizer.json', WEIGHT],
+        assetsRepo: ASSETS_REPO,
+        assetsRevision: SHA_OLD,
+        completedAt: 'x',
+      }),
+    );
+    symlinkSync(external, finalDir());
+
+    // Same primary revision (SHA_DEFAULT), so skip-detection reaches the
+    // refresh; the assets repo advanced and no longer supplies tokenizer.json,
+    // so the refresh wants to mutate — and must not, through the link.
+    hub.manifest = [{ type: 'file', path: WEIGHT, size: 300 }];
+    hub.manifests[ASSETS_REPO] = [{ type: 'file', path: 'config.json', size: 12 }];
+    hub.shaByRepo[ASSETS_REPO] = SHA_NEW;
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ [WEIGHT]: 300, 'config.json': 12 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
+
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(true);
+
+    // The refresh fell through to a real download+publish: the link was
+    // replaced by an owned REAL directory carrying the current marker.
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    expect(isModelInstalled(finalDir())).toBe(true);
+    const marker = JSON.parse(readFileSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER), 'utf-8')) as {
+      assetsRepo?: string;
+      assetsRevision?: string;
+    };
+    expect(marker.assetsRepo).toBe(ASSETS_REPO);
+    expect(marker.assetsRevision).toBe(SHA_NEW);
+
+    // The external target is byte-for-byte intact: no sidecar was deleted and
+    // the marker was never rewritten through the link.
+    expect(readFileSync(join(external, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(readFileSync(join(external, 'tokenizer.json'))).toEqual(Buffer.alloc(20, 0xab));
+    expect(readFileSync(join(external, WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
+    expect((JSON.parse(readFileSync(externalMarker, 'utf-8')) as { assetsRevision?: string }).assetsRevision).toBe(
+      SHA_OLD,
+    );
+
+    rmSync(external, { recursive: true, force: true });
+  });
+
   // macOS-only: the immutable flag is the one way to keep a file regular (so
   // the install still reads as installed and the refresh path really runs)
   // while making `rm` refuse it.
@@ -1979,14 +2049,13 @@ describe('DownloadManager', () => {
     }
   });
 
-  it('fails fast on a LIVE final symlink → external marked dir — before any bytes (no-follow ownership)', async () => {
+  it('installs over a LIVE final symlink → external marked dir, replacing only the LINK', async () => {
     // `<modelsDir>/<slug>` is a LIVE symlink whose target is an EXTERNAL directory
-    // that itself carries a valid completion marker. `existsSync`/`readFileSync`
-    // FOLLOW the link, so a laxer ownership check reads the foreign marker and thinks
-    // the dir is downloader-owned — proceeding to overwrite/report-done through a path
-    // the runner never wrote. The occupancy check is no-follow (`lstatSync` sees the
-    // link) and `isDownloaderOwned` is no-follow (it `lstat`-gates on a real directory
-    // before reading the marker), so the preflight refuses UP FRONT.
+    // carrying a valid completion marker. Ownership now FOLLOWS the link — the
+    // foreign marker is a truthful record of the install the link names — so the
+    // job is admitted, and the owned swap is safe by construction: `rename` moves
+    // the LINK aside and `rm` on a dir-symlink unlinks it; the external target is
+    // never written through.
     const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
     writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
     writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
@@ -2006,18 +2075,13 @@ describe('DownloadManager', () => {
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
-    // Refused BEFORE the manifest was listed (no `start`) and BEFORE any file was
-    // fetched (no bytes copied, no staging tree created); never reported done.
-    expect(events.some((event) => event.type === 'start')).toBe(false);
-    expect(events.some((event) => event.type === 'done')).toBe(false);
-    expect(hub.downloaded).toEqual([]);
-    expect(jobStagingDirs()).toEqual([]);
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(true);
 
-    const err = events.find((event) => event.type === 'error');
-    expect(err?.type).toBe('error');
-    if (err?.type === 'error') {
-      expect(err.message).toMatch(/not created by the dashboard/i);
-    }
+    // The link was replaced by a REAL staged dir — not a symlink, our marker inside.
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    expect(lstatSync(finalDir()).isDirectory()).toBe(true);
+    expect(isModelInstalled(finalDir())).toBe(true);
 
     // The external target is byte-for-byte intact — nothing was written through the link.
     expect(readFileSync(join(external, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
@@ -2026,15 +2090,14 @@ describe('DownloadManager', () => {
     rmSync(external, { recursive: true, force: true });
   });
 
-  it('does NOT reap a dead-owner rollback backup when finalDir is a LIVE foreign symlink (preflight before sweep)', async () => {
+  it('keeps a dead-owner rollback backup when finalDir is a LIVE foreign symlink, then installs over the link', async () => {
     // finalDir is a LIVE symlink into an EXTERNAL complete marked model AND a
     // dead-owner rollback backup (`<slug>.backup-<deadpid>.<uuid>`) sits under
-    // `.staging`. The recovery sweep's reap branch uses `isModelInstalled(finalDir)`,
-    // which FOLLOWS symlinks: if the sweep runs before the no-follow ownership
-    // preflight refuses the link, it follows the link → reads the foreign marker as
-    // "installed" → permanently deletes the recoverable backup — data loss for a
-    // doomed job. The preflight must run BEFORE the sweep (and the reap site must
-    // classify finalDir no-follow), so a foreign symlink leaves the backup untouched.
+    // `.staging`. The link admits the job now (its target is marked), so the
+    // recovery sweep DOES run — but its final classification is `lstat`, which
+    // reports any symlink as not-a-directory, so the link is classified
+    // "other occupant" and the recoverable backup is RETAINED. The job then
+    // installs: the swap moves the LINK aside and `rm` unlinks it.
     const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
     writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
     writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
@@ -2063,23 +2126,19 @@ describe('DownloadManager', () => {
     manager.subscribe(id, (event) => events.push(event));
     await waitFor(() => events.some((event) => event.type === 'done' || event.type === 'error'));
 
-    // Fast-fail: refused up front — no manifest listing, no bytes, never done.
-    expect(events.some((event) => event.type === 'start')).toBe(false);
-    expect(events.some((event) => event.type === 'done')).toBe(false);
-    expect(hub.downloaded).toEqual([]);
-    const err = events.find((event) => event.type === 'error');
-    expect(err?.type).toBe('error');
-    if (err?.type === 'error') {
-      expect(err.message).toMatch(/not created by the dashboard/i);
-    }
+    expect(events.some((event) => event.type === 'error')).toBe(false);
+    expect(events.some((event) => event.type === 'done')).toBe(true);
 
-    // The recoverable dead-owner rollback backup was NOT reaped — byte-for-byte intact.
+    // The recoverable dead-owner rollback backup was NOT reaped or restored —
+    // byte-for-byte intact under `.staging`.
     expect(existsSync(backup)).toBe(true);
     expect(readFileSync(join(backup, 'config.json'))).toEqual(Buffer.alloc(12, 0x5a));
     expect(readFileSync(join(backup, WEIGHT))).toEqual(Buffer.alloc(300, 0x5a));
     expect(backupDirs()).toEqual([`${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`]);
 
-    // The external symlink target is byte-for-byte intact — nothing written through the link.
+    // The link was replaced by a real install; the external target is untouched.
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(false);
+    expect(isModelInstalled(finalDir())).toBe(true);
     expect(readFileSync(join(external, 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
     expect(readFileSync(join(external, WEIGHT))).toEqual(Buffer.alloc(300, 0xab));
 
@@ -2288,6 +2347,53 @@ describe('DownloadManager', () => {
     expect(existsSync(join(finalDir(), DOWNLOAD_COMPLETE_MARKER))).toBe(true);
     expect(backupDirs()).toEqual([]);
     expect(hub.downloaded).toEqual([]);
+  });
+
+  it('restores an owned dead-owner SYMLINK backup whose final dir is missing, keeping the model present when the follow-up fails', async () => {
+    // An owned symlinked finalDir can legitimately end up as a rollback backup:
+    // publish admits the link (isDownloaderOwned follows it), then renames the
+    // LINK aside before installing staged content. A crash between those renames
+    // leaves the backup a symlink into a marked external install — ownership
+    // still proves through the link, so the sweep restores it. Every catalog
+    // entry carries an assetsRepo, so the restored link's sidecar refresh is
+    // refused (a refresh never writes through a live link) and the job takes the
+    // full path anyway; the rollback's payoff is that an ERROR mid-download now
+    // leaves the canonical path pointing at the complete install instead of
+    // reporting the model missing.
+    const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
+    writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
+    writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
+    writeFileSync(
+      join(external, DOWNLOAD_COMPLETE_MARKER),
+      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', WEIGHT], completedAt: 'x' }),
+    );
+    mkdirSync(stagingRoot(), { recursive: true });
+    const backup = join(stagingRoot(), `${SLUG}.backup-999999999.55555555-5555-5555-5555-555555555555`);
+    symlinkSync(external, backup);
+    expect(existsSync(finalDir())).toBe(false);
+    hub.failOn = [WEIGHT];
+
+    const manager = new DownloadManager({
+      modelsDir,
+      cacheDir,
+      fetchImpl: makeFetchImpl({ 'config.json': 12, [WEIGHT]: 300 }),
+    });
+    const events: DownloadEvent[] = [];
+    const id = manager.start(REPO);
+    manager.subscribe(id, (event) => events.push(event));
+    await waitFor(() => events.some((event) => event.type === 'error'));
+
+    // The backup LINK was renamed back onto finalDir before the download failed:
+    // the canonical path resolves to the complete external install, and the link
+    // itself is intact in .staging only as long as it took to be promoted.
+    expect(lstatSync(finalDir()).isSymbolicLink()).toBe(true);
+    expect(readFileSync(join(finalDir(), 'config.json'))).toEqual(Buffer.alloc(12, 0xab));
+    expect(backupDirs()).toEqual([]);
+    // The error came from the weight fetch — the job genuinely attempted the
+    // follow-up download (the refresh-refusal path), not a preflight refuse.
+    expect(events.some((event) => event.type === 'done')).toBe(false);
+
+    rmSync(external, { recursive: true, force: true });
   });
 
   it('reaps a leaked dead-owner publish backup when its final dir already exists', async () => {
@@ -2726,12 +2832,9 @@ describe('DownloadManager', () => {
     const external = mkdtempSync(join(tmpdir(), 'dash-dl-ext-'));
     writeFileSync(join(external, 'config.json'), Buffer.alloc(12, 0xab));
     writeFileSync(join(external, WEIGHT), Buffer.alloc(300, 0xab));
-    writeFileSync(
-      join(external, DOWNLOAD_COMPLETE_MARKER),
-      // repo + revision MATCH the resolved snapshot so pre-fix skip-detection would
-      // read the foreign marker as already-installed and emit `done` through the link.
-      JSON.stringify({ repo: REPO, revision: hub.sha, files: ['config.json', WEIGHT], completedAt: 'x' }),
-    );
+    // NO marker: the target is a FOREIGN install — `isDownloaderOwned` follows the
+    // backup link, finds nothing it ever wrote, and the dead-owner backup fails
+    // the restore gate even though it parses and its owner is dead.
     // A dead-owner (pid 999999999) rollback backup that is a SYMLINK into `external`.
     mkdirSync(stagingRoot(), { recursive: true });
     const backup = join(stagingRoot(), `${SLUG}.backup-999999999.44444444-4444-4444-4444-444444444444`);

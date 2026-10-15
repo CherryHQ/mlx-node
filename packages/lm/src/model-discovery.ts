@@ -1,8 +1,8 @@
 /** Shared, native-free discovery of local chat checkpoints. */
 
 import type { Dirent } from 'node:fs';
-import { readdir, stat } from 'node:fs/promises';
-import { basename, join } from 'node:path';
+import { readdir, realpath, stat } from 'node:fs/promises';
+import { basename, dirname, join } from 'node:path';
 
 import {
   launchPresetFor,
@@ -101,10 +101,40 @@ interface ModelFileInventory {
   hasPrimarySafetensors: boolean;
 }
 
+/**
+ * Resolve a `readdir(withFileTypes)` entry to the kind of object it POINTS AT.
+ *
+ * `Dirent.isFile()` / `isDirectory()` reflect the directory entry itself, so
+ * both return `false` for a symlink — symlinked models and GGUFs were
+ * silently invisible to discovery. For links we `stat()` (follows the
+ * target) instead of `lstat()`: discovery must classify the object the
+ * loader will actually open. A dangling or unreadable link resolves to
+ * `'other'` (skipped, same as sockets/fifos — a broken link admits
+ * nothing) and non-symlink entries keep their `Dirent` answer unchanged.
+ */
+export async function resolveDirentKind(
+  dir: string,
+  entry: Dirent,
+): Promise<'file' | 'dir' | 'other'> {
+  if (!entry.isSymbolicLink()) {
+    if (entry.isFile()) return 'file';
+    if (entry.isDirectory()) return 'dir';
+    return 'other';
+  }
+  try {
+    const resolved = await stat(join(dir, entry.name));
+    if (resolved.isFile()) return 'file';
+    if (resolved.isDirectory()) return 'dir';
+    return 'other';
+  } catch {
+    return 'other';
+  }
+}
+
 async function modelFileInventory(modelDir: string): Promise<ModelFileInventory> {
-  const files = (await readdir(modelDir, { withFileTypes: true }))
-    .filter((entry) => entry.isFile())
-    .map((entry) => entry.name);
+  const entries = await readdir(modelDir, { withFileTypes: true });
+  const kinds = await Promise.all(entries.map((entry) => resolveDirentKind(modelDir, entry)));
+  const files = entries.filter((_, index) => kinds[index] === 'file').map((entry) => entry.name);
   return {
     targetGgufs: files.filter((name) => name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(name)).sort(),
     hasGguf: files.some((name) => name.toLowerCase().endsWith('.gguf')),
@@ -293,20 +323,30 @@ export async function discoverLocalChatModels(
   const appendGguf = async (name: string, metadataRoot: string, scopeName: string): Promise<void> => {
     const path = join(metadataRoot, name);
     try {
-      const modelType = await detectModelType(path);
+      // `resolveDirentKind` admits a symlinked `.gguf`, but the loader
+      // canonicalizes the path it is handed (`prepare_native_gguf_inner`), so
+      // every check that looks BESIDE the file — family detection's sibling
+      // config.json, the `requiresAssets` gate, discovery metadata — must run
+      // against the resolved target's directory, not the link's. `realpath`
+      // also resolves a symlinked PARENT directory, covering a linked-in
+      // model dir wholesale. The recorded path stays the lexical link path:
+      // loading it reaches the same canonical file either way.
+      const canonical = await realpath(path);
+      const assetsRoot = dirname(canonical);
+      const modelType = await detectModelType(canonical);
       const family = familyDataFor(modelType);
       if (!supportedGgufName(name, modelType)) return;
       // A sibling config must agree with the target header, never a projector.
-      if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(path))) return;
+      if (!family?.ggufArchitectures?.includes(await readGgufArchitecture(canonical))) return;
       if (
         family.ggufDiscovery?.requiresAssets &&
-        !(await hasGgufAssets(metadataRoot, (error) => reportFailure(error, path)))
+        !(await hasGgufAssets(assetsRoot, (error) => reportFailure(error, path)))
       ) {
         if (debug)
           console.warn(`[mlx] skip ${path}: native ${modelType} GGUF requires sibling config.json and tokenizer.json`);
         return;
       }
-      await append(ggufModelName(name), path, metadataRoot, modelType, scopeName);
+      await append(ggufModelName(name), path, assetsRoot, modelType, scopeName);
     } catch (err) {
       reportFailure(err, path);
       if (debug) console.warn(`[mlx] skip ${path}: ${(err as Error).message}`);
@@ -314,13 +354,16 @@ export async function discoverLocalChatModels(
   };
 
   for (const entry of entries) {
-    if (entry.isFile() && entry.name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(entry.name)) {
+    // Dirent kind reflects the link itself, never the target — resolve so a
+    // symlinked `.gguf` or model directory classifies by what it points at.
+    const kind = await resolveDirentKind(modelsDir, entry);
+    if (kind === 'file' && entry.name.toLowerCase().endsWith('.gguf') && !GGUF_COMPANION_NAME.test(entry.name)) {
       await appendGguf(entry.name, modelsDir, basename(modelsDir));
       continue;
     }
     // Native Qwen4 GGUF loads publish tokenizer/config sidecars here, including
     // temporary directories during publication. They contain no model weights.
-    if (!entry.isDirectory() || entry.name.startsWith('.mlx-qwen4-assets-')) continue;
+    if (kind !== 'dir' || entry.name.startsWith('.mlx-qwen4-assets-')) continue;
     const full = join(modelsDir, entry.name);
     try {
       const inventory = await modelFileInventory(full);
