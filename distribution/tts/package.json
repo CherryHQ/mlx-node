@@ -1,0 +1,27 @@
+{
+  "name": "@cherrystudio/mlx-tts",
+  "version": "0.0.16-cherry.1",
+  "description": "MLX Node TTS JavaScript API with externally provisioned native bindings",
+  "license": "MIT",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "src",
+    "core.cjs",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CherryHQ/mlx-node.git",
+    "directory": "distribution/tts"
+  },
+  "upstreamRevision": "5db3d24bc87a9eb6fdb48c7ab3c9d8f126bf8d7d"
+}
