@@ -32,3 +32,13 @@ fork's next artifact release. It requires `tar` to be available to Node. The old
 are reviewed and published. Its unused JavaScript is excluded during extraction.
 Publication of native files and an npm version is a separate, reviewed step;
 neither packaging script publishes anything.
+
+## ASR package
+
+`asr/` packages the same pinned upstream ASR API with its matching NAPI loader and
+TypeScript declarations. Generate it with `node scripts/package-cherry-asr.mjs`.
+It has no native payload, install hook, microphone permission request or automatic
+download. Set `NAPI_RS_NATIVE_LIBRARY_PATH` before importing it, as for TTS.
+The host owns audio capture, PCM decoding and utility-process lifetime. The pinned
+native ASR API has no explicit model-dispose method; process exit releases its
+model thread and weights. This package does not change the shared native archive.
